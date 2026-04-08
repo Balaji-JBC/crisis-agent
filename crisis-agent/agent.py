@@ -14,17 +14,20 @@ from .tools.calendar_tool import create_calendar_event
 from .tools.tasks_tool    import create_task
 from .tools.db_tool       import log_session, get_past_sessions
 
-# ── Logging + env ─────────────────────────────
+
+# ── Logging + env ─────────────────────────────────────────────────
 cloud_logging_client = google.cloud.logging.Client()
 cloud_logging_client.setup_logging()
 load_dotenv()
 
 MODEL = os.getenv("MODEL", "gemini-2.5-flash")
 
-# ── Wikipedia Tool (LangchainTool — proven pattern) ───────────────
+
+# ── Wikipedia tool ────────────────────────────────────────────────
 wikipedia_tool = LangchainTool(
     tool=WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
 )
+
 
 # ── State tool: saves crisis input ────────────────────────────────
 def start_crisis_session(
@@ -40,168 +43,125 @@ def start_crisis_session(
     logging.info(f"[State] Crisis session started: {crisis_input}")
     return {"status": "session_started"}
 
-# ─────────────────────────────────────────────
-# Sub-Agent 1 — Info Gatherer
-# Reads:  CRISIS_INPUT, LOCATION from state
-# Writes: state["raw_info"]  via output_key
-# ─────────────────────────────────────────────
-info_gatherer_agent = Agent(
-    name="info_gatherer",
+
+# ─────────────────────────────────────────────────────────────────
+# Sub-Agent 1 — Researcher + Planner  (merged: saves 1 LLM call)
+# Reads:  CRISIS_INPUT, SEVERITY, LOCATION from state
+# Writes: state["action_plan"] via output_key
+# ─────────────────────────────────────────────────────────────────
+researcher_planner_agent = Agent(
+    name="researcher_planner",
     model=MODEL,
-    description="Searches Wikipedia for crisis background, protocols, and supplies needed.",
+    description="Searches Wikipedia for crisis context then builds a structured action plan.",
     instruction="""
-You are the Information Gatherer sub-agent in a Crisis Planner system.
+You are the Research and Planning agent in a Crisis Planner system.
 
-Search Wikipedia to research the following crisis:
-
-Crisis:   { CRISIS_INPUT }
-Location: { LOCATION }
-
-Find:
-  1. What this kind of event typically involves
-  2. Standard safety protocols
-  3. Essential supplies people need
-  4. Key timings or phases
-
-Return ONLY this JSON (no extra text):
-{
-  "background":  "2-3 sentence summary",
-  "protocols":   ["step 1", "step 2"],
-  "supplies":    ["item 1", "item 2"],
-  "key_timings": ["timing note 1"]
-}
-""",
-    tools=[wikipedia_tool],
-    output_key="raw_info",
-)
-
-# ─────────────────────────────────────────────
-# Sub-Agent 2 — Action Planner
-# Reads:  raw_info, CRISIS_INPUT, SEVERITY from state
-# Writes: state["action_plan"]  via output_key
-# ─────────────────────────────────────────────
-action_planner_agent = Agent(
-    name="action_planner",
-    model=MODEL,
-    description="Converts gathered info into a structured action plan.",
-    instruction="""
-You are the Action Planner sub-agent in a Crisis Planner system.
-
+You have been given the following details:
 Crisis:   { CRISIS_INPUT }
 Severity: { SEVERITY }
+Location: { LOCATION }
 
-Research findings:
-{ raw_info }
+Search Wikipedia to learn about this type of crisis. Look for what it typically involves,
+standard safety protocols, essential supplies people need, and key timings or phases.
 
-Optionally call get_past_sessions to recall similar past crises.
+You may also call get_past_sessions to check if similar crises have been handled before.
 
-Return ONLY this JSON:
+After researching, produce a plan. Return ONLY a valid JSON object in this exact format
+with no extra text, no markdown, and no code fences:
+
 {
-  "summary":  "one sentence",
+  "summary":  "one sentence describing the situation",
   "severity": "mild | moderate | severe",
   "calendar_events": [
     {
-      "title":       "Check government announcement",
+      "title":       "event title",
       "start_iso":   "2026-04-09T09:00:00+05:30",
       "end_iso":     "2026-04-09T09:30:00+05:30",
-      "description": "Monitor official updates"
+      "description": "what to do at this time"
     }
   ],
   "tasks": [
-    { "title": "Buy 5L water", "notes": "Get from nearest supermarket" }
+    { "title": "task title", "notes": "details about this task" }
   ],
-  "warnings": ["Stay indoors after 6pm"]
+  "warnings": ["warning 1", "warning 2", "warning 3"]
 }
 
-Use today's date as reference. Return ONLY valid JSON.
+Use today's date as the reference for scheduling. Return ONLY valid JSON.
 """,
-    tools=[get_past_sessions],
+    tools=[wikipedia_tool, get_past_sessions],
     output_key="action_plan",
 )
 
-# ─────────────────────────────────────────────
-# Sub-Agent 3 — Executor
-# Reads:  action_plan, CRISIS_INPUT from state
-# Creates Calendar events, Tasks, logs to DB
-# ─────────────────────────────────────────────
-executor_agent = Agent(
-    name="executor",
-    model=MODEL,
-    description="Creates Google Calendar events and Tasks, then saves session to DB.",
-    instruction="""
-You are the Executor sub-agent in a Crisis Planner system.
 
-Execute this action plan completely:
+# ─────────────────────────────────────────────────────────────────
+# Sub-Agent 2 — Executor + Presenter  (merged: saves 1 LLM call)
+# Reads:  action_plan, CRISIS_INPUT from state
+# Creates Calendar events, Tasks, logs session, then presents
+# ─────────────────────────────────────────────────────────────────
+executor_presenter_agent = Agent(
+    name="executor_presenter",
+    model=MODEL,
+    description="Creates Google Calendar events and Tasks, logs the session, then presents results.",
+    instruction="""
+You are the Executor and Presenter agent in a Crisis Planner system.
+
+You have an action plan to carry out. Do not write any code. Do not use print statements.
+Just call the tools and then write your summary.
+
+Here is the action plan:
 { action_plan }
 
-Steps — do ALL of them in order:
-  1. Call create_calendar_event for EVERY item in calendar_events
-  2. Call create_task for EVERY item in tasks
-  3. Call log_session once with:
-       - crisis_input             = { CRISIS_INPUT }
-       - severity                 = severity from the plan
-       - action_plan              = the full plan as a string
-       - calendar_events_created  = count of events you created
-       - tasks_created            = count of tasks you created
+Crisis description: { CRISIS_INPUT }
 
-After all tool calls, return a short plain-English summary.
+Start by using the create_calendar_event tool for every event listed in calendar_events.
+Call it once per event with the title, start_iso, end_iso, and description from the plan.
+
+Next, use the create_task tool for every item listed in tasks.
+Call it once per task with the title and notes from the plan.
+
+Then use the log_session tool exactly once to record this session.
+Pass the crisis description, the severity from the plan, the full action plan as a string,
+the number of calendar events you created, and the number of tasks you created.
+
+After all the tools have finished, write a friendly and reassuring plain-English summary
+for the user. Your summary should include:
+- A one-sentence description of the situation
+- The calendar events that were added, listed by title with a checkmark
+- The tasks that were added, listed by title with a notepad emoji
+- The top three warnings from the plan
+
+Do not include any raw JSON or code blocks in your final response.
 """,
     tools=[create_calendar_event, create_task, log_session],
 )
 
-# ── Sub-Agent 4 — Presenter ───────────────────
-presenter_agent = Agent(
-    name="presenter",
-    model=MODEL,
-    description="Formats the completed crisis plan into a friendly, readable response.",
-    instruction="""
-You are the Presenter sub-agent. Your job is to present the completed crisis
-plan to the user in a friendly, readable format.
 
-Based on the action plan below, present:
-  1. A one-line summary of the situation
-  2. ✅ What was added to Google Calendar (list the event titles)
-  3. 📝 What was added to Google Tasks (list the task titles)
-  4. ⚠️  Top 3 warnings to keep in mind
-
-Be conversational and reassuring. NO raw JSON. NO code blocks.
-
-Action plan:
-{ action_plan }
-""",
-)
-
-# ─────────────────────────────────────────────
-# Sequential pipeline
-# ─────────────────────────────────────────────
+# ── Sequential pipeline ───────────────────────────────────────────
 crisis_workflow = SequentialAgent(
     name="crisis_workflow",
-    description="Runs the full pipeline: gather info → plan → execute.",
+    description="Runs the full pipeline: research and plan, then execute and present.",
     sub_agents=[
-        info_gatherer_agent,
-        action_planner_agent,
-        executor_agent,
-        presenter_agent
+        researcher_planner_agent,
+        executor_presenter_agent,
     ],
 )
 
-# ─────────────────────────────────────────────
-# Root Agent  ← ADK entry point
-# ─────────────────────────────────────────────
+
+# ── Root Agent  ← ADK entry point ────────────────────────────────
 root_agent = Agent(
     name="crisis_planner_orchestrator",
     model=MODEL,
     description="Crisis Planner entry point. Collects crisis details then runs the full pipeline.",
     instruction="""
-You are the Crisis Planner assistant.
+You are the Crisis Planner assistant. Greet the user warmly.
 
-Greet the user and ask them to describe:
-  1. What the crisis or event is
-  2. How severe it seems (mild / moderate / severe)
-  3. Their location (city)
+Ask them to tell you three things:
+- What the crisis or emergency situation is
+- How severe it seems to them (mild, moderate, or severe)
+- What city or location they are in
 
-Once they respond, call start_crisis_session with their answers.
-Then immediately transfer control to crisis_workflow.
+Once they have provided all three, call the start_crisis_session tool with their answers.
+Then immediately hand off to the crisis_workflow to handle the rest.
 """,
     tools=[start_crisis_session],
     sub_agents=[crisis_workflow],
