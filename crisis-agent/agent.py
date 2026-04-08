@@ -149,6 +149,28 @@ After all tool calls, return a short plain-English summary.
     tools=[create_calendar_event, create_task, log_session],
 )
 
+# ── Sub-Agent 4 — Presenter ───────────────────
+presenter_agent = Agent(
+    name="presenter",
+    model=MODEL,
+    description="Formats the completed crisis plan into a friendly, readable response.",
+    instruction="""
+You are the Presenter sub-agent. Your job is to present the completed crisis
+plan to the user in a friendly, readable format.
+
+Based on the action plan below, present:
+  1. A one-line summary of the situation
+  2. ✅ What was added to Google Calendar (list the event titles)
+  3. 📝 What was added to Google Tasks (list the task titles)
+  4. ⚠️  Top 3 warnings to keep in mind
+
+Be conversational and reassuring. NO raw JSON. NO code blocks.
+
+Action plan:
+{ action_plan }
+""",
+)
+
 # ─────────────────────────────────────────────
 # Sequential pipeline
 # ─────────────────────────────────────────────
@@ -159,6 +181,7 @@ crisis_workflow = SequentialAgent(
         info_gatherer_agent,
         action_planner_agent,
         executor_agent,
+        presenter_agent
     ],
 )
 
