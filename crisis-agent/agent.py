@@ -2,21 +2,20 @@ import os
 import logging
 import google.cloud.logging
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 from google.adk import Agent
 from google.adk.agents import SequentialAgent
 from google.adk.tools.tool_context import ToolContext
 from google.adk.tools import google_search
 
-# Assuming these are your custom tools
-from .tools.calendar_tool import create_calendar_event
-from .tools.tasks_tool    import create_task
-from .tools.db_tool       import log_session, get_past_sessions
-from .tools.execute_tool  import execute_action_plan
+from .tools.db_tool      import log_session, get_past_sessions
+from .tools.execute_tool import execute_action_plan
 
-# Setup
-cloud_logging_client = google.cloud.logging.Client()
-cloud_logging_client.setup_logging()
+try:
+    google.cloud.logging.Client().setup_logging()
+except Exception:
+    logging.basicConfig(level=logging.INFO)
+
 load_dotenv()
 
 MODEL = os.getenv("MODEL", "gemini-2.5-flash")
@@ -36,36 +35,37 @@ def start_crisis_session(
 
 
 def get_researcher_instruction():
-    today = datetime.now().strftime("%Y-%m-%d")
+    today    = datetime.now().strftime("%Y-%m-%d")
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     return f"""
-Search Google for current, real-world information regarding the following situation: 
-{{ CRISIS_INPUT }} in {{ LOCATION }} (severity: {{ SEVERITY }}).
+Search Google for current information about: {{ CRISIS_INPUT }} in {{ LOCATION }} (severity: {{ SEVERITY }}).
 
-Today's date is {today}. All calendar_events must use dates from {today} onwards. Never use past dates.
+Today is {today}. Every date in calendar_events must be {today} or later — never in the past.
 
-Based on your search, create a structured action plan. If the crisis spans multiple days, ensure your calendar events reflect that duration. Include specific, actionable steps to perform inside the event 'description'.
+Create one calendar_event per day of the crisis. Do NOT create a single multi-day event.
+For example, a 3-day crisis starting today produces 3 separate events on consecutive days.
+Each event runs 09:00–18:00 IST. Include specific actions in each event's description.
 
-Return ONLY valid JSON, no markdown formatting, no extra text:
+Respond with ONLY raw JSON — no markdown, no code fences, no explanation.
+The JSON goes directly to the next agent; the user does not see it.
+
 {{
-  "summary": "One sentence summary of the situation based on your search.",
+  "summary": "one sentence about the situation",
   "severity": "mild|moderate|severe",
   "calendar_events": [
-    {{
-      "title": "...", 
-      "start_iso": "{today}T09:00:00+05:30", 
-      "end_iso": "{today}T18:00:00+05:30", 
-      "description": "List of actions: 1. Stay indoors. 2. Drink water..."
-    }}
+    {{"title": "Day 1 - ...", "start_iso": "{today}T09:00:00+05:30",    "end_iso": "{today}T18:00:00+05:30",    "description": "1. Action one. 2. Action two."}},
+    {{"title": "Day 2 - ...", "start_iso": "{tomorrow}T09:00:00+05:30", "end_iso": "{tomorrow}T18:00:00+05:30", "description": "1. Action one. 2. Action two."}}
   ],
-  "tasks": [{{"title": "...", "notes": "..."}}],
+  "tasks":    [{{"title": "...", "notes": "..."}}],
   "warnings": ["...", "...", "..."]
 }}
 """
 
+
 researcher_planner_agent = Agent(
     name="researcher_planner",
     model=MODEL,
-    description="Researches the crisis using Google Search and returns a structured action plan as JSON.",
+    description="Searches Google for crisis info and returns a raw JSON action plan.",
     instruction=get_researcher_instruction(),
     tools=[google_search],
     output_key="action_plan",
@@ -75,18 +75,13 @@ researcher_planner_agent = Agent(
 executor_presenter_agent = Agent(
     name="executor_presenter",
     model=MODEL,
-    description="Executes the action plan and presents a friendly summary.",
+    description="Executes the action plan via tools and returns a friendly summary.",
     instruction="""
-You have received the planned JSON. Call execute_action_plan with the action_plan string and crisis description.
+Call execute_action_plan with these two arguments:
+  action_plan:  { action_plan }
+  crisis_input: { CRISIS_INPUT }
 
-action_plan:     { action_plan }
-crisis_input:    { CRISIS_INPUT }
-
-After the tool returns successfully, write a friendly plain-English summary using the result:
-- 🚨 One-sentence situation summary
-- 📅 Calendar events scheduled (Confirm the action list was added to the description)
-- 📝 Tasks added
-- ⚠️ Top 3 warnings
+Return the tool's response exactly as-is. Do not add, remove, or rephrase anything.
 """,
     tools=[execute_action_plan],
 )
@@ -104,15 +99,16 @@ root_agent = Agent(
     model=MODEL,
     description="Collects crisis details from the user and runs the crisis planning pipeline.",
     instruction="""
-You are the Crisis Planner assistant. 
-If the user provides a scenario (e.g., "severe heat for next 3 days in Bangalore"), extract or ask for:
-1. The crisis or emergency situation
-2. Severity (mild / moderate / severe)
-3. Their city
+You are the Crisis Planner assistant.
+If the user provides a scenario (e.g. "severe heat for 3 days in Bangalore"), extract the details.
+Otherwise ask for:
+  1. The crisis or emergency situation
+  2. Severity (mild / moderate / severe)
+  3. Their city
 
-Once you have all three, call `start_crisis_session` with their answers.
-Then call `get_past_sessions` to check for similar past events and note any relevant context.
-Finally, hand off to `crisis_workflow`.
+Once you have all three, call start_crisis_session with their answers.
+Then call get_past_sessions to check for similar past events and note relevant context.
+Then hand off to crisis_workflow.
 """,
     tools=[start_crisis_session, get_past_sessions],
     sub_agents=[crisis_workflow],
