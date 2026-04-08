@@ -10,9 +10,9 @@ from google.adk.tools.langchain_tool import LangchainTool
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 
-from tools.calendar_tool import create_calendar_event
-from tools.tasks_tool    import create_task
-from tools.db_tool       import log_session, get_past_sessions
+from .tools.calendar_tool import create_calendar_event
+from .tools.tasks_tool    import create_task
+from .tools.db_tool       import log_session, get_past_sessions
 
 # ── Logging + env ─────────────────────────────
 cloud_logging_client = google.cloud.logging.Client()
